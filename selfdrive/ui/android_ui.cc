@@ -23,55 +23,6 @@ static void set_do_exit(int sig) {
   do_exit = 1;
 }
 
-
-static void* light_sensor_thread(void *args) {
-  set_thread_name("light_sensor");
-
-  int err;
-  UIState *s = (UIState*)args;
-  s->light_sensor = 0.0;
-
-  struct sensors_poll_device_t* device;
-  struct sensors_module_t* module;
-
-  hw_get_module(SENSORS_HARDWARE_MODULE_ID, (hw_module_t const**)&module);
-  sensors_open(&module->common, &device);
-
-  // need to do this
-  struct sensor_t const* list;
-  module->get_sensors_list(module, &list);
-
-  int SENSOR_LIGHT = 7;
-
-  err = device->activate(device, SENSOR_LIGHT, 0);
-  if (err != 0) goto fail;
-  err = device->activate(device, SENSOR_LIGHT, 1);
-  if (err != 0) goto fail;
-
-  device->setDelay(device, SENSOR_LIGHT, ms2ns(100));
-
-  while (!do_exit) {
-    static const size_t numEvents = 1;
-    sensors_event_t buffer[numEvents];
-
-    int n = device->poll(device, buffer, numEvents);
-    if (n < 0) {
-      LOG_100("light_sensor_poll failed: %d", n);
-    }
-    if (n > 0) {
-      s->light_sensor = buffer[0].light;
-    }
-  }
-  sensors_close(device);
-  return NULL;
-
-fail:
-  LOGE("LIGHT SENSOR IS MISSING");
-  s->light_sensor = 255;
-
-  return NULL;
-}
-
 static void ui_set_brightness(UIState *s, int brightness) {
   static int last_brightness = -1;
   if (last_brightness != brightness && (s->awake || brightness == 0)) {
@@ -92,26 +43,38 @@ static void enable_event_processing(bool yes) {
   }
 }
 
-static void set_awake(UIState *s, bool awake) {
-  if (awake) {
-    // 30 second timeout
-    s->awake_timeout = 30*UI_FREQ;
-  }
-  if (s->awake != awake) {
-    s->awake = awake;
+static void handle_display_state(UIState *s, bool user_input) {
+  
+  static int display_timeout = 0;
+  static int display_mode = HWC_POWER_MODE_OFF;
 
-    // TODO: replace command_awake and command_sleep with direct calls to android
-    if (awake) {
-      LOGW("awake normal");
-      framebuffer_set_power(s->fb, HWC_POWER_MODE_NORMAL);
-      enable_event_processing(true);
+  // TODO: implement wake up on accelerometer
+
+  // determine what state the display should be in
+  int desired_mode = display_mode;
+  if (s->started || user_input) {
+    desired_mode = HWC_POWER_MODE_NORMAL;
+    display_timeout = 5*UI_FREQ;
+  } else {
+    if (display_timeout > 0) {
+      display_timeout--;
     } else {
-      LOGW("awake off");
-      ui_set_brightness(s, 0);
-      framebuffer_set_power(s->fb, HWC_POWER_MODE_DOZE);
-      enable_event_processing(false);
+      desired_mode = HWC_POWER_MODE_DOZE;
     }
   }
+
+  // handle state transition
+  if (display_mode != desired_mode) {
+    display_mode = desired_mode;
+    LOGW("awake %d", display_mode);
+
+    framebuffer_set_power(s->fb, display_mode);
+    enable_event_processing(display_mode == HWC_POWER_MODE_NORMAL);
+    if (display_mode != HWC_POWER_MODE_NORMAL) {
+      ui_set_brightness(s, 0);
+    }
+  }
+  s->awake = display_mode == HWC_POWER_MODE_NORMAL;
 }
 
 static void handle_vision_touch(UIState *s, int touch_x, int touch_y) {
@@ -175,9 +138,7 @@ int main(int argc, char* argv[]) {
   UIState uistate = {};
   UIState *s = &uistate;
   ui_init(s);
-  set_awake(s, true);
-  enable_event_processing(true);
-
+   
   PubMaster *pm = new PubMaster({"offroadLayout"});
 
   pthread_t connect_thread_handle;
@@ -185,14 +146,10 @@ int main(int argc, char* argv[]) {
                        vision_connect_thread, s);
   assert(err == 0);
 
-  pthread_t light_sensor_thread_handle;
-  err = pthread_create(&light_sensor_thread_handle, NULL,
-                       light_sensor_thread, s);
-  assert(err == 0);
-
   TouchState touch = {0};
   touch_init(&touch);
   s->touch_fd = touch.fd;
+  handle_display_state(s, true);
 
   // light sensor scaling params
   const bool LEON = util::read_file("/proc/cmdline").find("letv") != std::string::npos;
@@ -226,7 +183,6 @@ int main(int argc, char* argv[]) {
     pthread_mutex_lock(&s->lock);
     double u1 = millis_since_boot();
 
-    // light sensor is only exposed on EONs
     float clipped_brightness = (s->light_sensor*brightness_m) + brightness_b;
     if (clipped_brightness > 512) clipped_brightness = 512;
     smooth_brightness = clipped_brightness * 0.01 + smooth_brightness * 0.99;
@@ -238,7 +194,6 @@ int main(int argc, char* argv[]) {
     int touch_x = -1, touch_y = -1;
     int touched = touch_poll(&touch, &touch_x, &touch_y, 0);
     if (touched == 1) {
-      set_awake(s, true);
       handle_sidebar_touch(s, touch_x, touch_y);
       handle_vision_touch(s, touch_x, touch_y);
     }
@@ -247,7 +202,6 @@ int main(int argc, char* argv[]) {
       // always process events offroad
       check_messages(s);
     } else {
-      set_awake(s, true);
       // Car started, fetch a new rgb image from ipc
       if (s->vision_connected){
         ui_update(s);
@@ -264,19 +218,13 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // manage wakefulness
-    if (s->awake_timeout > 0) {
-      s->awake_timeout--;
-    } else {
-      set_awake(s, false);
-    }
-
     // manage hardware disconnect
     if ((s->sm->frame - s->sm->rcv_frame("health")) > 5*UI_FREQ) {
       s->scene.hwType = cereal::HealthData::HwType::UNKNOWN;
     }
 
     // Don't waste resources on drawing in case screen is off
+    handle_display_state(s, touched);
     if (s->awake) {
       ui_draw(s);
       glFinish();
@@ -338,13 +286,12 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  set_awake(s, true);
+  handle_display_state(s, true);
 
   // wake up bg thread to exit
   pthread_mutex_lock(&s->lock);
   pthread_mutex_unlock(&s->lock);
 
-  // join light_sensor_thread?
   err = pthread_join(connect_thread_handle, NULL);
   assert(err == 0);
   delete s->sm;

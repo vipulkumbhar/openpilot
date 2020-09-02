@@ -25,8 +25,7 @@ int write_param_float(float param, const char* param_name, bool persistent_param
 void ui_init(UIState *s) {
   pthread_mutex_init(&s->lock, NULL);
   s->sm = new SubMaster({"model", "controlsState", "uiLayoutState", "liveCalibration", "radarState", "thermal",
-                         "health", "carParams", "ubloxGnss", "driverState", "dMonitoringState"
-  });
+                         "health", "carParams", "ubloxGnss", "driverState", "dMonitoringState", "sensorEvents"});
 
   s->ipc_fd = -1;
   s->scene.satelliteCount = -1;
@@ -186,6 +185,15 @@ void handle_message(UIState *s, SubMaster &sm) {
     scene.frontview = scene.dmonitoring_state.getIsPreview();
   } else if ((sm.frame - sm.rcv_frame("dMonitoringState")) > 1*UI_FREQ) {
     scene.frontview = false;
+  }
+  if (sm.updated("sensorEvents")) {
+    for (auto sensor : sm["sensorEvents"].getSensorEvents()) {
+      if (sensor.which() == cereal::SensorEventData::LIGHT) {
+        s->light_sensor = sensor.getLight(); 
+      } else if (sensor.which() == cereal::SensorEventData::ACCELERATION) {
+        s->accel_sensor = 0;
+      }
+    }
   }
 
   s->started = scene.thermal.getStarted() || scene.frontview;
